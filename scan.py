@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AutoWeb - Advanced XSS & SQLi Scanner (v2.2 - Auto-Detection)
+AutoWeb - Advanced XSS & SQLi Scanner (v2.3 - Payload Output Format)
 For authorized security testing only.
 """
 
@@ -20,9 +20,10 @@ from requests.exceptions import RequestException, Timeout, ConnectionError
 import logging
 import json
 from collections import defaultdict
+from datetime import datetime
+import urllib3
 
 # Disable SSL warnings
-import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ────────────────────────────────────────
@@ -293,11 +294,73 @@ TECHNOLOGY_SIGNATURES = {
     'Vue.js': ['vue', 'vue.js', 'v-'],
 }
 
+class ColorPrint:
+    """ANSI color codes for terminal output"""
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
+    @staticmethod
+    def success(text):
+        print(f"{ColorPrint.GREEN}{text}{ColorPrint.END}")
+
+    @staticmethod
+    def error(text):
+        print(f"{ColorPrint.RED}{text}{ColorPrint.END}")
+
+    @staticmethod
+    def warning(text):
+        print(f"{ColorPrint.YELLOW}{text}{ColorPrint.END}")
+
+    @staticmethod
+    def info(text):
+        print(f"{ColorPrint.CYAN}{text}{ColorPrint.END}")
+
+    @staticmethod
+    def bold(text):
+        print(f"{ColorPrint.BOLD}{text}{ColorPrint.END}")
+
+    @staticmethod
+    def payload_output(vuln_type, url, payload, parameter=None):
+        """Print vulnerability in the format: target.com<payload>"""
+        # Extract base URL (remove parameters)
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        
+        # If there are parameters, include them in the output
+        if parameter:
+            # Create a clean URL with the vulnerable parameter and payload
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            params[parameter] = [payload]
+            new_query = urllib.parse.urlencode(params, doseq=True)
+            full_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+            
+            # Clean version for display
+            clean_url = base_url
+            if parsed.query:
+                clean_url = f"{base_url}?{parsed.query}"
+            
+            # Output in the requested format: target.com<payload>
+            if vuln_type.startswith('XSS'):
+                print(f"{ColorPrint.RED}▶ {clean_url}{ColorPrint.END}{ColorPrint.GREEN}<{payload}>{ColorPrint.END}")
+            else:
+                print(f"{ColorPrint.RED}▶ {clean_url}{ColorPrint.END}{ColorPrint.YELLOW}<{payload}>{ColorPrint.END}")
+        else:
+            # Simple output without parameter
+            print(f"{ColorPrint.RED}▶ {base_url}{ColorPrint.END}{ColorPrint.GREEN}<{payload}>{ColorPrint.END}")
+
 class AutoWebScanner:
     def __init__(self, target_url: str, threads: int = 5, timeout: int = 10,
                  cookies: Optional[Dict] = None, headers: Optional[Dict] = None,
                  crawl_depth: int = 2, delay: float = 0, xss_advanced: bool = True,
-                 sqli_advanced: bool = True, auto_detect: bool = True):
+                 sqli_advanced: bool = True, auto_detect: bool = True,
+                 output_file: Optional[str] = None, verbose: bool = False):
         self.target_url = target_url.rstrip('/')
         self.visited: Set[str] = set()
         self.forms: List[Dict] = []
@@ -310,6 +373,8 @@ class AutoWebScanner:
         self.xss_advanced = xss_advanced
         self.sqli_advanced = sqli_advanced
         self.auto_detect = auto_detect
+        self.output_file = output_file
+        self.verbose = verbose
         self.waf_detected = False
         self.waf_name = "None"
         self.technologies = set()
@@ -331,6 +396,13 @@ class AutoWebScanner:
         self.domain = urlparse(target_url).netloc
         self.request_count = 0
         self.max_requests = 10000
+        self.start_time = datetime.now()
+        
+        # For output file
+        if self.output_file:
+            self.output_handle = open(self.output_file, 'w')
+            self.output_handle.write(f"# AutoWeb Scan Results - {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self.output_handle.write(f"# Target: {self.target_url}\n\n")
 
     def get_xss_payloads(self) -> List[str]:
         return XSS_PAYLOADS_BASIC + (XSS_PAYLOADS_ADVANCED if self.xss_advanced else [])
@@ -365,6 +437,12 @@ class AutoWebScanner:
         except Exception as e:
             return None
 
+    def log_to_file(self, text: str):
+        """Write output to file if specified"""
+        if self.output_file:
+            self.output_handle.write(text + '\n')
+            self.output_handle.flush()
+
     # ────────────────────────────────────────
     # Auto-Detection Methods
     # ────────────────────────────────────────
@@ -384,23 +462,26 @@ class AutoWebScanner:
         """Discover common paths on the target."""
         discovered = set()
         
-        # Try common paths
+        if self.verbose:
+            print("[*] Discovering common paths...")
+        
         for path in COMMON_PATHS:
             test_url = f"{self.target_url}/{path}"
             r = self.safe_request('head', test_url)
             if r and r.status_code < 400:
                 discovered.add(test_url)
                 self.discovered_urls.add(test_url)
-                print(f"  [Discovered] {test_url} (status: {r.status_code})")
+                if self.verbose:
+                    print(f"  [Discovered] {test_url} (status: {r.status_code})")
         
-        # Try common extensions
         for ext in COMMON_EXTENSIONS:
             test_url = f"{self.target_url}{ext}"
             r = self.safe_request('head', test_url)
             if r and r.status_code < 400:
                 discovered.add(test_url)
                 self.discovered_urls.add(test_url)
-                print(f"  [Discovered] {test_url} (status: {r.status_code})")
+                if self.verbose:
+                    print(f"  [Discovered] {test_url} (status: {r.status_code})")
         
         return discovered
 
@@ -408,7 +489,6 @@ class AutoWebScanner:
         """Get common parameters based on detected technologies."""
         params = set(COMMON_PARAMETERS)
         
-        # Add technology-specific parameters
         for tech in self.technologies:
             if 'PHP' in tech:
                 params.update(['PHPSESSID', 'lang'])
@@ -427,7 +507,6 @@ class AutoWebScanner:
         """Test for technology-specific pages and files."""
         tech_pages = []
         
-        # WordPress
         if 'WordPress' in self.technologies:
             wp_paths = [
                 '/wp-admin', '/wp-login.php', '/wp-content', '/wp-includes',
@@ -439,9 +518,9 @@ class AutoWebScanner:
                 if r and r.status_code < 400:
                     tech_pages.append(test_url)
                     self.discovered_urls.add(test_url)
-                    print(f"  [Discovered WP] {test_url}")
+                    if self.verbose:
+                        print(f"  [Discovered WP] {test_url}")
         
-        # Django
         if 'Django' in self.technologies:
             django_paths = ['/admin', '/static', '/media']
             for path in django_paths:
@@ -451,7 +530,6 @@ class AutoWebScanner:
                     tech_pages.append(test_url)
                     self.discovered_urls.add(test_url)
         
-        # ASP.NET
         if 'ASP.NET' in self.technologies:
             asp_paths = ['/login.aspx', '/default.aspx', '/web.config']
             for path in asp_paths:
@@ -465,15 +543,14 @@ class AutoWebScanner:
 
     def discover_dynamic_parameters(self) -> Dict[str, List[str]]:
         """Discover potential parameters from forms and JavaScript."""
-        print("[*] Discovering dynamic parameters...")
+        if self.verbose:
+            print("[*] Discovering dynamic parameters...")
         
         discovered_params = {}
         
-        # Visit discovered pages to extract parameters
-        for url in list(self.discovered_urls)[:20]:  # Limit to avoid too many requests
+        for url in list(self.discovered_urls)[:20]:
             r = self.safe_request('get', url)
             if r and r.status_code == 200:
-                # Extract from forms
                 forms = self.extract_forms(r.text, url)
                 for form in forms:
                     for inp in form['inputs']:
@@ -482,7 +559,6 @@ class AutoWebScanner:
                         elif url not in discovered_params[inp['name']]:
                             discovered_params[inp['name']].append(url)
                 
-                # Extract from JavaScript (simple regex)
                 js_patterns = re.findall(r'[?&]([a-zA-Z_][a-zA-Z0-9_]*)=', r.text)
                 for param in js_patterns:
                     if param not in discovered_params:
@@ -490,7 +566,6 @@ class AutoWebScanner:
                     elif url not in discovered_params[param]:
                         discovered_params[param].append(url)
         
-        # Add to all_parameters
         for param in discovered_params:
             self.all_parameters.add(param)
         
@@ -501,7 +576,7 @@ class AutoWebScanner:
     # ────────────────────────────────────────
 
     def detect_waf(self) -> str:
-        print("[*] Checking for WAF/IPS...")
+        ColorPrint.info("[*] Checking for WAF/IPS...")
         for payload in WAF_DETECTION_PAYLOADS:
             try:
                 params = {'test': payload}
@@ -513,12 +588,11 @@ class AutoWebScanner:
                                 self.waf_detected = True
                                 self.waf_name = waf_name
                                 result = f"[!] WAF Detected: {waf_name} (via header signature: {sig})"
-                                print(result)
+                                ColorPrint.warning(result)
                                 return result
             except Exception:
                 continue
 
-        # Check status code change
         try:
             clean_r = self.safe_request('get', self.target_url)
             if clean_r:
@@ -529,15 +603,15 @@ class AutoWebScanner:
                     )
                     if dirty_r and dirty_r.status_code in [403, 406, 429, 503] and clean_r.status_code == 200:
                         self.waf_detected = True
-                        self.waf_name = f"Status-based"
+                        self.waf_name = "Status-based"
                         result = f"[!] WAF/IPS Detected: {self.waf_name}"
-                        print(result)
+                        ColorPrint.warning(result)
                         return result
         except Exception:
             pass
 
         result = "[*] No WAF detected or unable to determine."
-        print(result)
+        ColorPrint.info(result)
         return result
 
     # ────────────────────────────────────────
@@ -622,19 +696,18 @@ class AutoWebScanner:
 
             html = r.text
             
-            # Detect technologies
             self.detect_technologies(html, r.headers)
 
-            # Extract forms
             page_forms = self.extract_forms(html, url)
             if page_forms:
-                print(f"  [Forms] Found {len(page_forms)} form(s) on {url}")
+                if self.verbose:
+                    print(f"  [Forms] Found {len(page_forms)} form(s) on {url}")
                 self.forms.extend(page_forms)
 
-            # Extract parameters
             params = self.extract_url_params(url)
             if params:
-                print(f"  [Params] Found {len(params)} parameter(s) on {url}: {params}")
+                if self.verbose:
+                    print(f"  [Params] Found {len(params)} parameter(s) on {url}: {params}")
                 self.all_parameters.update(params)
 
             if depth < self.crawl_depth:
@@ -644,7 +717,8 @@ class AutoWebScanner:
                         self.crawl(link, depth + 1)
 
         except Exception as e:
-            print(f"  [!] Crawl error on {url}: {str(e)[:80]}")
+            if self.verbose:
+                print(f"  [!] Crawl error on {url}: {str(e)[:80]}")
 
     # ────────────────────────────────────────
     # XSS Testing
@@ -701,6 +775,7 @@ class AutoWebScanner:
                         'url': test_url,
                         'parameter': param,
                         'payload': payload[:200],
+                        'full_url': test_url
                     }
 
             except Exception:
@@ -739,6 +814,7 @@ class AutoWebScanner:
                             'parameter': inp['name'],
                             'payload': payload[:200],
                             'method': method.upper(),
+                            'full_url': url
                         })
                         break
 
@@ -747,27 +823,27 @@ class AutoWebScanner:
         return findings
 
     def test_xss_common_parameters(self) -> List[Dict]:
-        """Test XSS on common parameters discovered during auto-detection."""
         findings = []
-        print("[*] Testing discovered/common parameters for XSS...")
+        if self.verbose:
+            print("[*] Testing discovered/common parameters for XSS...")
         
         test_urls = list(self.discovered_urls) + [self.target_url]
-        test_urls = test_urls[:10]  # Limit to avoid too many requests
+        test_urls = test_urls[:10]
         
         common_params = self.get_common_parameters()
         
         for url in test_urls:
             for param in common_params:
-                # Skip if already tested
                 result = self.test_xss_reflected(url, param)
                 if result:
                     findings.append(result)
-                    print(f"  [XSS FOUND] {param} @ {url[:100]}")
+                    ColorPrint.payload_output('XSS', url, result['payload'], param)
+                    self.log_to_file(f"{url}<{result['payload']}>")
         
         return findings
 
     def scan_xss(self):
-        print("\n[===== XSS SCAN =====]")
+        ColorPrint.bold("\n[===== XSS SCAN =====]")
         all_findings = []
         payloads_count = len(self.get_xss_payloads())
 
@@ -794,7 +870,7 @@ class AutoWebScanner:
 
         if param_tasks:
             total = len(param_tasks)
-            print(f"[*] Testing {total} URL parameter(s) with {payloads_count} XSS payloads each...")
+            ColorPrint.info(f"[*] Testing {total} URL parameter(s) with {payloads_count} XSS payloads each...")
             with ThreadPoolExecutor(max_workers=min(self.threads, len(param_tasks))) as executor:
                 futures = {
                     executor.submit(self.test_xss_reflected, url, param): (url, param)
@@ -805,14 +881,14 @@ class AutoWebScanner:
                         result = future.result(timeout=self.timeout+5)
                         if result:
                             all_findings.append(result)
-                            print(f"  [XSS FOUND] {result['parameter']} @ {result['url'][:100]}")
-                            print(f"    Payload: {result['payload'][:120]}")
+                            ColorPrint.payload_output('XSS', result['url'], result['payload'], result['parameter'])
+                            self.log_to_file(f"{result['url']}<{result['payload']}>")
                     except Exception as e:
                         continue
 
         # 4) Test forms
         if self.forms:
-            print(f"[*] Testing {len(self.forms)} form(s) with {payloads_count} XSS payloads each...")
+            ColorPrint.info(f"[*] Testing {len(self.forms)} form(s) with {payloads_count} XSS payloads each...")
             with ThreadPoolExecutor(max_workers=min(self.threads, len(self.forms))) as executor:
                 futures = {executor.submit(self.test_xss_form, form): form for form in self.forms}
                 for future in as_completed(futures):
@@ -820,14 +896,16 @@ class AutoWebScanner:
                         results = future.result(timeout=self.timeout+5)
                         for result in results:
                             all_findings.append(result)
-                            print(f"  [XSS FOUND] {result['parameter']} ({result['method']}) @ {result['url'][:100]}")
-                            print(f"    Payload: {result['payload'][:120]}")
+                            ColorPrint.payload_output('XSS', result['url'], result['payload'], result['parameter'])
+                            self.log_to_file(f"{result['url']}<{result['payload']}>")
                     except Exception as e:
                         continue
 
         self.xss_vulns = all_findings
         if not all_findings:
-            print("[*] No XSS vulnerabilities found.")
+            ColorPrint.info("[*] No XSS vulnerabilities found.")
+        else:
+            ColorPrint.success(f"[+] Found {len(all_findings)} XSS vulnerability(ies)")
         return all_findings
 
     # ────────────────────────────────────────
@@ -873,6 +951,7 @@ class AutoWebScanner:
                         'url': test_url,
                         'parameter': param,
                         'payload': payload[:200],
+                        'full_url': test_url
                     }
                     for pattern in SQLI_ERROR_INDICATORS:
                         match = re.search(pattern, r.text, re.IGNORECASE)
@@ -891,6 +970,7 @@ class AutoWebScanner:
                             'parameter': param,
                             'payload': payload[:200],
                             'detail': f'Status {baseline_status} → {r.status_code}',
+                            'full_url': test_url
                         }
 
                 if baseline_length > 0:
@@ -903,6 +983,7 @@ class AutoWebScanner:
                                 'parameter': param,
                                 'payload': payload[:200],
                                 'detail': f'Size: {baseline_length} → {len(r.text)} (diff: {content_diff})',
+                                'full_url': test_url
                             }
 
                 if elapsed >= self.timeout * 0.8:
@@ -913,6 +994,7 @@ class AutoWebScanner:
                             'parameter': param,
                             'payload': payload[:200],
                             'detail': f'Response: {elapsed:.2f}s',
+                            'full_url': test_url
                         }
 
             except Timeout:
@@ -923,6 +1005,7 @@ class AutoWebScanner:
                         'parameter': param,
                         'payload': payload[:200],
                         'detail': 'Request timed out',
+                        'full_url': url
                     }
             except Exception:
                 continue
@@ -987,6 +1070,7 @@ class AutoWebScanner:
                             'parameter': inp['name'],
                             'payload': payload[:200],
                             'method': method.upper(),
+                            'full_url': url
                         })
                         break
 
@@ -1000,6 +1084,7 @@ class AutoWebScanner:
                                     'parameter': inp['name'],
                                     'payload': payload[:200],
                                     'method': method.upper(),
+                                    'full_url': url
                                 })
                                 break
 
@@ -1012,6 +1097,7 @@ class AutoWebScanner:
                                 'payload': payload[:200],
                                 'method': method.upper(),
                                 'detail': f'{elapsed:.2f}s',
+                                'full_url': url
                             })
                             break
 
@@ -1024,6 +1110,7 @@ class AutoWebScanner:
                             'payload': payload[:200],
                             'method': method.upper(),
                             'detail': 'Timed out',
+                            'full_url': url
                         })
                         break
                 except Exception:
@@ -1032,7 +1119,7 @@ class AutoWebScanner:
         return findings
 
     def scan_sqli(self):
-        print("\n[===== SQLi SCAN =====]")
+        ColorPrint.bold("\n[===== SQLi SCAN =====]")
         all_findings = []
         payloads_count = len(self.get_sqli_payloads())
 
@@ -1059,7 +1146,7 @@ class AutoWebScanner:
 
         if param_tasks:
             total = len(param_tasks)
-            print(f"[*] Testing {total} URL parameter(s) with {payloads_count} SQLi payloads each...")
+            ColorPrint.info(f"[*] Testing {total} URL parameter(s) with {payloads_count} SQLi payloads each...")
             with ThreadPoolExecutor(max_workers=min(self.threads, len(param_tasks))) as executor:
                 futures = {
                     executor.submit(self.test_sqli_reflected, url, param): (url, param)
@@ -1070,15 +1157,14 @@ class AutoWebScanner:
                         result = future.result(timeout=self.timeout+5)
                         if result:
                             all_findings.append(result)
-                            f_type = result['type'].split('(')[0].strip()
-                            print(f"  [SQLi FOUND] [{f_type}] {result['parameter']} @ {result['url'][:80]}")
-                            print(f"    Payload: {result['payload'][:120]}")
+                            ColorPrint.payload_output('SQLi', result['url'], result['payload'], result['parameter'])
+                            self.log_to_file(f"{result['url']}<{result['payload']}>")
                     except Exception as e:
                         continue
 
         # 4) Test forms
         if self.forms:
-            print(f"[*] Testing {len(self.forms)} form(s) with {payloads_count} SQLi payloads each...")
+            ColorPrint.info(f"[*] Testing {len(self.forms)} form(s) with {payloads_count} SQLi payloads each...")
             with ThreadPoolExecutor(max_workers=min(self.threads, len(self.forms))) as executor:
                 futures = {executor.submit(self.test_sqli_form, form): form for form in self.forms}
                 for future in as_completed(futures):
@@ -1086,14 +1172,16 @@ class AutoWebScanner:
                         results = future.result(timeout=self.timeout+5)
                         for result in results:
                             all_findings.append(result)
-                            print(f"  [SQLi FOUND] [{result['type'].split('(')[0].strip()}] {result['parameter']} @ {result['url'][:80]}")
-                            print(f"    Payload: {result['payload'][:120]}")
+                            ColorPrint.payload_output('SQLi', result['url'], result['payload'], result['parameter'])
+                            self.log_to_file(f"{result['url']}<{result['payload']}>")
                     except Exception as e:
                         continue
 
         self.sqli_vulns = all_findings
         if not all_findings:
-            print("[*] No SQL injection vulnerabilities found.")
+            ColorPrint.info("[*] No SQL injection vulnerabilities found.")
+        else:
+            ColorPrint.success(f"[+] Found {len(all_findings)} SQLi vulnerability(ies)")
         return all_findings
 
     # ────────────────────────────────────────
@@ -1102,9 +1190,11 @@ class AutoWebScanner:
 
     def generate_report(self):
         print("\n" + "=" * 70)
-        print("                     FINAL REPORT")
+        ColorPrint.bold("                     FINAL REPORT")
         print("=" * 70)
 
+        elapsed_time = datetime.now() - self.start_time
+        
         print(f"\nTarget:      {self.target_url}")
         print(f"Domain:      {self.domain}")
         print(f"Pages crawled: {len(self.visited)}")
@@ -1116,42 +1206,64 @@ class AutoWebScanner:
         print(f"XSS Payloads tested: {len(self.get_xss_payloads())}")
         print(f"SQLi Payloads tested: {len(self.get_sqli_payloads())}")
         print(f"Total requests made: {self.request_count}")
+        print(f"Scan duration: {str(elapsed_time).split('.')[0]}")
 
         print("\n" + "-" * 70)
-        print("XSS VULNERABILITIES")
+        ColorPrint.bold("XSS VULNERABILITIES (URL<PAYLOAD> format)")
         print("-" * 70)
         if self.xss_vulns:
-            for i, vuln in enumerate(self.xss_vulns, 1):
-                print(f"\n  #{i}")
-                print(f"  Type:      {vuln['type']}")
-                print(f"  URL:       {vuln['url']}")
-                print(f"  Parameter: {vuln['parameter']}")
-                print(f"  Payload:   {vuln['payload']}")
-                if 'method' in vuln:
-                    print(f"  Method:    {vuln['method']}")
+            print("\n" + ColorPrint.BOLD + "Copy-paste these URLs for testing:" + ColorPrint.END + "\n")
+            for vuln in self.xss_vulns:
+                # Clean up URL for display
+                url = vuln.get('full_url', vuln.get('url', ''))
+                payload = vuln['payload']
+                ColorPrint.payload_output('XSS', url, payload, vuln.get('parameter'))
         else:
             print("\n  None found.")
 
         print("\n" + "-" * 70)
-        print("SQL INJECTION VULNERABILITIES")
+        ColorPrint.bold("SQL INJECTION VULNERABILITIES (URL<PAYLOAD> format)")
         print("-" * 70)
         if self.sqli_vulns:
-            for i, vuln in enumerate(self.sqli_vulns, 1):
-                print(f"\n  #{i}")
-                print(f"  Type:      {vuln['type']}")
-                print(f"  URL:       {vuln['url']}")
-                print(f"  Parameter: {vuln['parameter']}")
-                print(f"  Payload:   {vuln['payload']}")
-                if 'method' in vuln:
-                    print(f"  Method:    {vuln['method']}")
+            print("\n" + ColorPrint.BOLD + "Copy-paste these URLs for testing:" + ColorPrint.END + "\n")
+            for vuln in self.sqli_vulns:
+                url = vuln.get('full_url', vuln.get('url', ''))
+                payload = vuln['payload']
+                ColorPrint.payload_output('SQLi', url, payload, vuln.get('parameter'))
                 if 'detail' in vuln:
-                    print(f"  Detail:    {vuln['detail']}")
+                    print(f"    {ColorPrint.CYAN}[Detail]{ColorPrint.END} {vuln['detail']}")
         else:
             print("\n  None found.")
 
+        # Summary of vulnerable payloads (simple format)
+        if self.xss_vulns or self.sqli_vulns:
+            print("\n" + "-" * 70)
+            ColorPrint.bold("QUICK REFERENCE - Vulnerable URLs")
+            print("-" * 70 + "\n")
+            
+            if self.xss_vulns:
+                ColorPrint.bold("XSS Vulnerabilities:")
+                for vuln in self.xss_vulns:
+                    url = vuln.get('full_url', vuln.get('url', ''))
+                    payload = vuln['payload']
+                    print(f"  {url}<{payload}>")
+                    self.log_to_file(f"{url}<{payload}>")
+            
+            if self.sqli_vulns:
+                ColorPrint.bold("\nSQL Injection Vulnerabilities:")
+                for vuln in self.sqli_vulns:
+                    url = vuln.get('full_url', vuln.get('url', ''))
+                    payload = vuln['payload']
+                    print(f"  {url}<{payload}>")
+                    self.log_to_file(f"{url}<{payload}>")
+
         print("\n" + "=" * 70)
-        print("                END OF REPORT")
+        ColorPrint.bold("                END OF REPORT")
         print("=" * 70)
+
+        if self.output_file:
+            self.output_handle.close()
+            ColorPrint.success(f"[+] Results saved to: {self.output_file}")
 
 
 # ────────────────────────────────────────
@@ -1160,11 +1272,19 @@ class AutoWebScanner:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AutoWeb v2.2 - Advanced XSS & SQLi Scanner with Auto-Detection",
+        description="AutoWeb v2.3 - Advanced XSS & SQLi Scanner with Payload Output Format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python autoweb.py -u target.com
+  python autoweb.py -u https://target.com --verbose
+  python autoweb.py -u target.com -o results.txt
+  python autoweb.py -u target.com --xss-only --threads 10
+        """
     )
 
     parser.add_argument('-u', '--url', required=True, help='Target URL (e.g., http://target.com)')
+    parser.add_argument('-o', '--output', help='Save results to file')
     parser.add_argument('--crawl-depth', type=int, default=2, help='Crawl depth (default: 2)')
     parser.add_argument('--threads', type=int, default=5, help='Number of threads (default: 5)')
     parser.add_argument('--timeout', type=int, default=10, help='Request timeout in seconds (default: 10)')
@@ -1177,6 +1297,7 @@ def main():
     parser.add_argument('--header', type=str, action='append', help='Custom headers (format: Name: Value)')
     parser.add_argument('--no-waf', action='store_true', help='Skip WAF detection')
     parser.add_argument('--verify-ssl', action='store_true', help='Verify SSL certificates')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
 
     args = parser.parse_args()
 
@@ -1202,7 +1323,7 @@ def main():
    | |_| (_| || |_|  __/ |___| |___ | |   \ V  V /  
     \___/\__,_| \__|\___|\____|_____|_|    \_/\_/   
                                                      
-   AutoWeb v2.2 - XSS & SQLi Scanner (Auto-Detection)
+   AutoWeb v2.3 - XSS & SQLi Scanner (Payload Output)
    Authorized Security Testing Only
     """)
 
@@ -1221,6 +1342,8 @@ def main():
         xss_advanced=not args.no_advanced,
         sqli_advanced=not args.no_advanced,
         auto_detect=not args.no_auto_detect,
+        output_file=args.output,
+        verbose=args.verbose,
     )
 
     if not args.no_waf:
@@ -1229,22 +1352,16 @@ def main():
 
     # Auto-detection phase
     if scanner.auto_detect:
-        print("[*] Auto-detection phase started...")
-        print("[*] Discovering common paths...")
+        ColorPrint.info("[*] Auto-detection phase started...")
         scanner.discover_common_paths()
-        
-        print("[*] Discovering technology-specific pages...")
         scanner.test_for_tech_identified_pages()
-        
-        print("[*] Discovering dynamic parameters...")
         scanner.discover_dynamic_parameters()
-        
-        print(f"[*] Auto-detection complete. Discovered {len(scanner.discovered_urls)} URLs and {len(scanner.all_parameters)} parameters.")
+        ColorPrint.info(f"[*] Auto-detection complete. Discovered {len(scanner.discovered_urls)} URLs and {len(scanner.all_parameters)} parameters.")
         print()
 
-    print("[*] Starting crawl...")
+    ColorPrint.info("[*] Starting crawl...")
     scanner.crawl(args.url)
-    print(f"[*] Crawl complete. Visited {len(scanner.visited)} page(s), "
+    ColorPrint.info(f"[*] Crawl complete. Visited {len(scanner.visited)} page(s), "
           f"found {len(scanner.forms)} form(s).")
 
     if not args.sqli_only:
